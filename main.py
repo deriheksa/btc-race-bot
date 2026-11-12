@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Slow-trend cbBTC bot for btc-race-24h-20261112-1439 (agent-fun/bars-replay/v1).
+"""Slow-trend cbBTC bot v4 — COMPOUNDING via confirmed breakout re-entry (agent-fun/bars-replay/v1).
 
-Verified 2026-11-13 on the published dev window (local replay, exact
-harness fill math): net PnL +$8.53, 2 trades, max drawdown 0.30%,
-fees $0.80, deterministic (2 runs, byte-identical action logs).
+Verified 2026-11-13 (local replay, exact harness fill math): dev window
+net PnL +$8.53 (same as v1 — the re-entry never fires there), 2 trades,
+max drawdown 0.30%, deterministic (2 runs, byte-identical action logs).
+On a synthetic +5.9% rally: +$34.25 (9 trades) vs v1 +$7.27 (2 trades).
+On a synthetic brutal chop: worse than v1 (-$73 vs -$40) — the trade-off
+for compounding; both lose there, and the chop test is far choppier than
+real 1-minute BTC noise.
 
-Strategy (my own, swept on the published dev window):
-- Long-only, one position, all-in / all-out.
-- ENTRY: EMA(85) of 1-minute closes crosses above EMA(300) -> buy 100% of cash.
-  The slow pair only fires on a genuine multi-hour trend, so the bot trades
-  rarely (2 fills on the dev window) and pays almost no fees.
-- EXIT (whichever first): take-profit +0.9% over the entry fill price,
-  trailing stop 1.5% below the highest close since entry, or EMA(85)
-  crossing back below EMA(300).
-- After an exit the trend filter keeps the bot in cash while the slow EMA
-  stays below the fast one, so a long grind down is sat out, not ridden.
+v1: EMA(85) cross above EMA(300) -> buy 100% cash; exit on TP +0.9%,
+trailing stop 1.5%, or EMA cross back down. One trade per trend leg.
 
-Dev window (local replay, exact harness fill math): net PnL +$8.53,
-2 trades, max drawdown 0.30%, fees $0.80. Baselines on the same window:
-buy-and-hold -$25.97, momentum -$23.31, ema-cross(8/21) -$95.88.
-The chosen point sits on a broad plateau (EMA fast 75-100, slow 240-420,
-TP 0.8-0.9% all give +$7.6..+$8.5), not a sharp peak.
+v4 adds COMPOUNDING re-entry: after an exit, when the trend is still up
+(fast EMA > slow EMA) and the close breaks 0.3% ABOVE the last exit fill
+price, buy 100% of cash again — the cash now includes the previous leg's
+profit, so wins stack leg after leg in one trend instead of stopping at
+the first +0.9%. The +0.3% confirmation margin is the key: the dev
+window bobs only ~0.1% around the exit price before grinding down, so
+it never confirms (v3's plain break-above re-entered at bar 161 into
+the grind: -$1.41; the dip-required variant caught the same bob: -$1.88).
+A real resumption pushes 0.3% past the exit and re-enters. After a
+cross-down exit the trend filter (fast > slow) blocks re-entry until a
+fresh cross-up.
 
 Stdlib only, deterministic: EMAs are a pure function of the closes seen,
 no wall clock, no randomness, no environment. max_slippage_bps 300.
@@ -46,6 +48,7 @@ class Bot:
         self.ema_slow = None
         self.prev_fast = None
         self.prev_slow = None
+        self.last_exit_px = 0   # fill price of the last sell (breakout level)
         self.entry_px = 0         # fill price of the open position
         self.high_since_entry = 0
 
@@ -67,6 +70,7 @@ class Bot:
                     self.entry_px = int(f["price"])
                     self.high_since_entry = self.entry_px
                 elif f.get("side") == "sell":
+                    self.last_exit_px = int(f["price"])
                     self.entry_px = 0
                     self.high_since_entry = 0
 
@@ -84,10 +88,18 @@ class Bot:
         qty = holding.qty if holding else 0
 
         if qty == 0:
-            # Entry: fast EMA crosses above slow EMA.
-            if (self.prev_fast is not None and self.prev_slow is not None
-                    and self.ema_fast > self.ema_slow
-                    and self.prev_fast <= self.prev_slow):
+            # Entry 1: fast EMA crosses above slow EMA.
+            cross_up = (self.prev_fast is not None and self.prev_slow is not None
+                        and self.ema_fast > self.ema_slow
+                        and self.prev_fast <= self.prev_slow)
+            # Entry 2 (COMPOUNDING): trend still up and the close is
+            # 0.3% above the last exit fill price — a confirmed
+            # resumption, so ride the next leg with the grown cash.
+            breakout = (self.ema_fast > self.ema_slow
+                        and self.last_exit_px > 0
+                        and close > self.last_exit_px * 1.003)
+            if cross_up or breakout:
+                self.last_exit_px = 0
                 cash = state.cash
                 if cash >= 1_000_000:
                     return [{"side": "buy", "symbol": SYMBOL,
